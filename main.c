@@ -1,21 +1,17 @@
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/sysmem.h>
+#include <psp2kern/kernel/suspend.h>
 #include <psp2kern/bt.h>
 #include <psp2kern/ctrl.h>
 #include <psp2/touch.h>
 #include <taihen.h>
 #include "log.h"
 
-extern int ksceKernelPowerTick(int);
-
 #define DS3_VID 0x054C
 #define DS3_PID 0x0268
 
-#define DS3_ANALOG_THRESHOLD 5
-
-#define VITA_FRONT_TOUCHSCREEN_W 1920
-#define VITA_FRONT_TOUCHSCREEN_H 1080
+#define DS3_ANALOG_THRESHOLD 3
 
 #define abs(x) (((x) < 0) ? -(x) : (x))
 
@@ -105,6 +101,10 @@ static SceUID SceBt_sub_22999C8_hook_uid = -1;
 static tai_hook_ref_t SceBt_sub_22999C8_ref;
 static SceUID SceBt_sub_22947E4_hook_uid = -1;
 static tai_hook_ref_t SceBt_sub_22947E4_ref;
+static tai_hook_ref_t SceCtrl_sceCtrlReadBufferPositive2_ref;
+static SceUID SceCtrl_sceCtrlReadBufferPositive2_hook_uid = -1;
+static tai_hook_ref_t SceCtrl_sceCtrlPeekBufferPositive2_ref;
+static SceUID SceCtrl_sceCtrlPeekBufferPositive2_hook_uid = -1;
 
 static inline void ds3_input_reset(void)
 {
@@ -118,12 +118,12 @@ static int is_ds3(const unsigned short vid_pid[2])
 
 static inline void *mempool_alloc(unsigned int size)
 {
-	return ksceKernelMemPoolAlloc(bt_mempool_uid, size);
+	return ksceKernelAllocHeapMemory(bt_mempool_uid, size);
 }
 
 static inline void mempool_free(void *ptr)
 {
-	ksceKernelMemPoolFree(bt_mempool_uid, ptr);
+	ksceKernelFreeHeapMemory(bt_mempool_uid, ptr);
 }
 
 static int ds3_send_report(unsigned int mac0, unsigned int mac1, uint8_t flags, uint8_t report,
@@ -268,10 +268,20 @@ static void set_input_emulation(struct ds3_input_report *ds3)
 	if (ds3->left)
 		buttons |= SCE_CTRL_LEFT;
 
-	if (ds3->l1 || ds3->l2)
-		buttons |= (SCE_CTRL_L1 | SCE_CTRL_LTRIGGER);
-	if (ds3->r1 || ds3->r2)
-		buttons |= (SCE_CTRL_R1 | SCE_CTRL_RTRIGGER);
+	if (ds3->l1)
+		buttons |= SCE_CTRL_L1;
+	if (ds3->r1)
+		buttons |= SCE_CTRL_R1;
+
+	if (ds3->l2)
+		buttons |= SCE_CTRL_LTRIGGER;
+	if (ds3->r2)
+		buttons |= SCE_CTRL_RTRIGGER;
+
+	if (ds3->l3)
+		buttons |= SCE_CTRL_L3;
+	if (ds3->r3)
+		buttons |= SCE_CTRL_R3;
 
 	if (ds3->select)
 		buttons |= SCE_CTRL_SELECT;
@@ -291,10 +301,54 @@ static void set_input_emulation(struct ds3_input_report *ds3)
 
 	ksceCtrlSetAnalogEmulation(0, 0, ds3->left_x, ds3->left_y,
 		ds3->right_x, ds3->right_y, ds3->left_x, ds3->left_y,
-		ds3->right_x, ds3->right_y, 32);
+		ds3->right_x, ds3->right_y, 1);
 
 	if (buttons != 0 || js_moved)
 		ksceKernelPowerTick(0);
+}
+
+
+static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
+			    struct ds3_input_report *ds3)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		SceCtrlData k_data;
+
+		ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)pad_data, sizeof(k_data));
+		if (abs(ds3->left_x - 128) > DS3_ANALOG_THRESHOLD)
+			k_data.lx = ds3->left_x;
+		if (abs(ds3->left_y - 128) > DS3_ANALOG_THRESHOLD)
+			k_data.ly = ds3->left_y;
+		if (abs(ds3->right_x - 128) > DS3_ANALOG_THRESHOLD)
+			k_data.rx = ds3->right_x;
+		if (abs(ds3->right_y - 128) > DS3_ANALOG_THRESHOLD)
+			k_data.ry = ds3->right_y;
+		ksceKernelMemcpyKernelToUser((uintptr_t)pad_data, &k_data, sizeof(k_data));
+
+		pad_data++;
+	}
+}
+
+static int SceCtrl_sceCtrlPeekBufferPositive2_hook_func(int port, SceCtrlData *pad_data, int count)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositive2_ref, port, pad_data, count);
+
+	if (ret >= 0 && ds3_connected)
+		patch_analogdata(port, pad_data, count, &ds3_input);
+
+	return ret;
+}
+
+static int SceCtrl_sceCtrlReadBufferPositive2_hook_func(int port, SceCtrlData *pad_data, int count)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositive2_ref, port, pad_data, count);
+
+	if (ret >= 0 && ds3_connected)
+		patch_analogdata(port, pad_data, count, &ds3_input);
+
+	return ret;
 }
 
 static void enqueue_read_request(unsigned int mac0, unsigned int mac1,
@@ -542,7 +596,16 @@ int module_start(SceSize argc, const void *args)
 		&SceBt_sub_22947E4_ref, SceBt_modinfo.modid, 0,
 		0x22947E4 - 0x2280000, 1, SceBt_sub_22947E4_hook_func);
 
-	SceKernelMemPoolCreateOpt opt;
+	/* SceCtrl hooks (needed for PS4 remote play) */
+	SceCtrl_sceCtrlPeekBufferPositive2_hook_uid = taiHookFunctionExportForKernel(KERNEL_PID,
+		&SceCtrl_sceCtrlPeekBufferPositive2_ref, "SceCtrl", TAI_ANY_LIBRARY,
+		0x15F81E8C, SceCtrl_sceCtrlPeekBufferPositive2_hook_func);
+
+	SceCtrl_sceCtrlReadBufferPositive2_hook_uid = taiHookFunctionExportForKernel(KERNEL_PID,
+		&SceCtrl_sceCtrlReadBufferPositive2_ref, "SceCtrl", TAI_ANY_LIBRARY,
+		0xC4226A3E, SceCtrl_sceCtrlReadBufferPositive2_hook_func);
+
+	SceKernelHeapCreateOpt opt;
 	opt.size = 0x1C;
 	opt.uselock = 0x100;
 	opt.field_8 = 0x10000;
@@ -551,7 +614,7 @@ int module_start(SceSize argc, const void *args)
 	opt.field_14 = 0;
 	opt.field_18 = 0;
 
-	bt_mempool_uid = ksceKernelMemPoolCreate("ds3vita_mempool", 0x100, &opt);
+	bt_mempool_uid = ksceKernelCreateHeap("ds3vita_mempool", 0x100, &opt);
 	LOG("Bluetooth mempool UID: 0x%08X\n", bt_mempool_uid);
 
 	bt_thread_uid = ksceKernelCreateThread("ds3vita_bt_thread", ds3vita_bt_thread,
@@ -578,7 +641,7 @@ int module_stop(SceSize argc, const void *args)
 	}
 
 	if (bt_mempool_uid > 0) {
-		ksceKernelMemPoolDestroy(bt_mempool_uid);
+		ksceKernelDeleteHeap(bt_mempool_uid);
 	}
 
 	if (SceBt_sub_22999C8_hook_uid > 0) {
@@ -589,6 +652,16 @@ int module_stop(SceSize argc, const void *args)
 	if (SceBt_sub_22947E4_hook_uid > 0) {
 		taiHookReleaseForKernel(SceBt_sub_22947E4_hook_uid,
 			SceBt_sub_22947E4_ref);
+	}
+
+	if (SceCtrl_sceCtrlPeekBufferPositive2_hook_uid > 0) {
+		taiHookReleaseForKernel(SceCtrl_sceCtrlPeekBufferPositive2_hook_uid,
+			SceCtrl_sceCtrlPeekBufferPositive2_ref);
+	}
+
+	if (SceCtrl_sceCtrlReadBufferPositive2_hook_uid > 0) {
+		taiHookReleaseForKernel(SceCtrl_sceCtrlReadBufferPositive2_hook_uid,
+			SceCtrl_sceCtrlReadBufferPositive2_ref);
 	}
 
 	/*if (SceBt_sub_2292CE4_0x2292D18_patch_uid > 0) {
