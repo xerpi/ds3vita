@@ -6,12 +6,18 @@
 #include <psp2kern/ctrl.h>
 #include <psp2/touch.h>
 #include <taihen.h>
+#include <math.h>
 #include "log.h"
+
+/*
+ * Needed by newlib's libm.
+ */
+int __errno;
 
 #define DS3_VID 0x054C
 #define DS3_PID 0x0268
 
-#define DS3_ANALOG_THRESHOLD 3
+#define DS3_JOYSTICK_THRESHOLD 5
 
 #define EVF_EXIT	(1 << 0)
 
@@ -250,8 +256,10 @@ static void reset_input_emulation()
 
 static void set_input_emulation(struct ds3_input_report *ds3)
 {
+	signed char ldx, ldy, rdx, rdy;
 	unsigned int buttons = 0;
-	int js_moved = 0;
+	int left_js_moved = 0;
+	int right_js_moved = 0;
 
 	if (ds3->cross)
 		buttons |= SCE_CTRL_CROSS;
@@ -293,12 +301,16 @@ static void set_input_emulation(struct ds3_input_report *ds3)
 	if (ds3->ps)
 		buttons |= SCE_CTRL_INTERCEPTED;
 
-	if ((abs(ds3->left_x - 128) > DS3_ANALOG_THRESHOLD) ||
-	    (abs(ds3->left_y - 128) > DS3_ANALOG_THRESHOLD) ||
-	    (abs(ds3->right_x - 128) > DS3_ANALOG_THRESHOLD) ||
-	    (abs(ds3->right_y - 128) > DS3_ANALOG_THRESHOLD)) {
-		js_moved = 1;
-	}
+	ldx = ds3->left_x - 128;
+	ldy = ds3->left_y - 128;
+	rdx = ds3->right_x - 128;
+	rdy = ds3->right_y - 128;
+
+	if (sqrtf(ldx * ldx + ldy * ldy) > DS3_JOYSTICK_THRESHOLD)
+		left_js_moved = 1;
+
+ 	if (sqrtf(rdx * rdx + rdy * rdy) > DS3_JOYSTICK_THRESHOLD)
+		right_js_moved = 1;
 
 	ksceCtrlSetButtonEmulation(0, 0, buttons, buttons, 32);
 
@@ -306,7 +318,7 @@ static void set_input_emulation(struct ds3_input_report *ds3)
 		ds3->right_x, ds3->right_y, ds3->left_x, ds3->left_y,
 		ds3->right_x, ds3->right_y, 1);
 
-	if (buttons != 0 || js_moved)
+	if (buttons != 0 || left_js_moved || right_js_moved)
 		ksceKernelPowerTick(0);
 }
 
@@ -320,13 +332,13 @@ static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
 		SceCtrlData k_data;
 
 		ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)pad_data, sizeof(k_data));
-		if (abs(ds3->left_x - 128) > DS3_ANALOG_THRESHOLD)
+		if (abs(ds3->left_x - 128) > DS3_JOYSTICK_THRESHOLD)
 			k_data.lx = ds3->left_x;
-		if (abs(ds3->left_y - 128) > DS3_ANALOG_THRESHOLD)
+		if (abs(ds3->left_y - 128) > DS3_JOYSTICK_THRESHOLD)
 			k_data.ly = ds3->left_y;
-		if (abs(ds3->right_x - 128) > DS3_ANALOG_THRESHOLD)
+		if (abs(ds3->right_x - 128) > DS3_JOYSTICK_THRESHOLD)
 			k_data.rx = ds3->right_x;
-		if (abs(ds3->right_y - 128) > DS3_ANALOG_THRESHOLD)
+		if (abs(ds3->right_y - 128) > DS3_JOYSTICK_THRESHOLD)
 			k_data.ry = ds3->right_y;
 		ksceKernelMemcpyKernelToUser((uintptr_t)pad_data, &k_data, sizeof(k_data));
 
