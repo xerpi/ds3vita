@@ -13,6 +13,8 @@
 
 #define DS3_ANALOG_THRESHOLD 3
 
+#define EVF_EXIT	(1 << 0)
+
 #define abs(x) (((x) < 0) ? -(x) : (x))
 
 struct ds3_input_report {
@@ -85,6 +87,7 @@ struct ds3_input_report {
 } __attribute__((packed, aligned(32)));
 
 static SceUID bt_mempool_uid = -1;
+static SceUID bt_thread_evflag_uid = -1;
 static SceUID bt_thread_uid = -1;
 static SceUID bt_cb_uid = -1;
 static int bt_thread_run = 1;
@@ -546,7 +549,16 @@ static int ds3vita_bt_thread(SceSize args, void *argp)
 #endif*/
 
 	while (bt_thread_run) {
-		ksceKernelDelayThreadCB(200 * 1000);
+		int ret;
+		unsigned int evf_out;
+
+		ret = ksceKernelWaitEventFlagCB(bt_thread_evflag_uid, EVF_EXIT,
+			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &evf_out, NULL);
+		if (ret < 0)
+			continue;
+
+		if (evf_out & EVF_EXIT)
+			break;
 	}
 
 	if (ds3_connected) {
@@ -617,6 +629,10 @@ int module_start(SceSize argc, const void *args)
 	bt_mempool_uid = ksceKernelCreateHeap("ds3vita_mempool", 0x100, &opt);
 	LOG("Bluetooth mempool UID: 0x%08X\n", bt_mempool_uid);
 
+	bt_thread_evflag_uid = ksceKernelCreateEventFlag("ds3vita_bt_thread_evflag",
+							 0, 0, NULL);
+	LOG("Bluetooth thread event flag UID: 0x%08X\n", bt_thread_evflag_uid);
+
 	bt_thread_uid = ksceKernelCreateThread("ds3vita_bt_thread", ds3vita_bt_thread,
 		0x3C, 0x1000, 0, 0x10000, 0);
 	LOG("Bluetooth thread UID: 0x%08X\n", bt_thread_uid);
@@ -634,11 +650,19 @@ int module_stop(SceSize argc, const void *args)
 {
 	SceUInt timeout = 0xFFFFFFFF;
 
+	bt_thread_run = 0;
+
+	if (bt_thread_evflag_uid)
+		ksceKernelSetEventFlag(bt_thread_evflag_uid, EVF_EXIT);
+
 	if (bt_thread_uid > 0) {
 		bt_thread_run = 0;
 		ksceKernelWaitThreadEnd(bt_thread_uid, NULL, &timeout);
 		ksceKernelDeleteThread(bt_thread_uid);
 	}
+
+	if (bt_thread_evflag_uid)
+		ksceKernelDeleteEventFlag(bt_thread_evflag_uid);
 
 	if (bt_mempool_uid > 0) {
 		ksceKernelDeleteHeap(bt_mempool_uid);
