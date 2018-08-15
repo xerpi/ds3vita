@@ -18,10 +18,27 @@ int __errno;
 #define DS3_PID 0x0268
 
 #define DS3_JOYSTICK_THRESHOLD 5
+#define DS3_TRIGGER_THRESHOLD 1
 
 #define EVF_EXIT	(1 << 0)
 
 #define abs(x) (((x) < 0) ? -(x) : (x))
+
+#define DECL_FUNC_HOOK(name, ...) \
+	static tai_hook_ref_t name##_ref; \
+	static SceUID name##_hook_uid = -1; \
+	static int name##_hook_func(__VA_ARGS__)
+ #define BIND_FUNC_OFFSET_HOOK(name, pid, modid, segidx, offset, thumb) \
+	name##_hook_uid = taiHookFunctionOffsetForKernel((pid), \
+		&name##_ref, (modid), (segidx), (offset), thumb, name##_hook_func)
+ #define BIND_FUNC_EXPORT_HOOK(name, pid, module, lib_nid, func_nid) \
+	name##_hook_uid = taiHookFunctionExportForKernel((pid), \
+		&name##_ref, (module), (lib_nid), (func_nid), name##_hook_func)
+ #define UNBIND_FUNC_HOOK(name) \
+	do { \
+		if (name##_hook_uid > 0) \
+			taiHookReleaseForKernel(name##_hook_uid, name##_ref); \
+	} while(0)
 
 struct ds3_input_report {
 	unsigned char report_id;
@@ -110,10 +127,6 @@ static SceUID SceBt_sub_22999C8_hook_uid = -1;
 static tai_hook_ref_t SceBt_sub_22999C8_ref;
 static SceUID SceBt_sub_22947E4_hook_uid = -1;
 static tai_hook_ref_t SceBt_sub_22947E4_ref;
-static tai_hook_ref_t SceCtrl_sceCtrlReadBufferPositive2_ref;
-static SceUID SceCtrl_sceCtrlReadBufferPositive2_hook_uid = -1;
-static tai_hook_ref_t SceCtrl_sceCtrlPeekBufferPositive2_ref;
-static SceUID SceCtrl_sceCtrlPeekBufferPositive2_hook_uid = -1;
 
 static inline void ds3_input_reset(void)
 {
@@ -247,14 +260,20 @@ static int ds3_set_operational(unsigned int mac0, unsigned int mac1)
 	return 0;
 }
 
-static void reset_input_emulation()
+
+DECL_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, SceCtrlPortInfo *info)
 {
-	ksceCtrlSetButtonEmulation(0, 0, 0, 0, 32);
-	ksceCtrlSetAnalogEmulation(0, 0, 0x80, 0x80, 0x80, 0x80,
-		0x80, 0x80, 0x80, 0x80, 0);
+	int ret = TAI_CONTINUE(int, SceCtrl_ksceCtrlGetControllerPortInfo_ref, info);
+
+	if (ret >= 0 && ds3_connected) {
+		// info->port[0] |= SCE_CTRL_TYPE_VIRT;
+		info->port[1] = SCE_CTRL_TYPE_DS3;
+	}
+
+	return ret;
 }
 
-static void set_input_emulation(struct ds3_input_report *ds3)
+static void patch_ctrl_data(const struct ds3_input_report *ds3, SceCtrlData *pad_data)
 {
 	signed char ldx, ldy, rdx, rdy;
 	unsigned int buttons = 0;
@@ -312,19 +331,35 @@ static void set_input_emulation(struct ds3_input_report *ds3)
  	if (sqrtf(rdx * rdx + rdy * rdy) > DS3_JOYSTICK_THRESHOLD)
 		right_js_moved = 1;
 
-	ksceCtrlSetButtonEmulation(0, 0, buttons, buttons, 32);
+	if (left_js_moved) {
+		pad_data->lx = ds3->left_x;
+		pad_data->ly = ds3->left_y;
+	}
 
-	ksceCtrlSetAnalogEmulation(0, 0, ds3->left_x, ds3->left_y,
-		ds3->right_x, ds3->right_y, ds3->left_x, ds3->left_y,
-		ds3->right_x, ds3->right_y, 1);
+	if (right_js_moved) {
+		pad_data->rx = ds3->right_x;
+		pad_data->ry = ds3->right_y;
+	}
 
-	if (buttons != 0 || left_js_moved || right_js_moved)
+	if (ds3->L2_sens > DS3_TRIGGER_THRESHOLD)
+		pad_data->lt = ds3->L2_sens;
+
+	if (ds3->R2_sens > DS3_TRIGGER_THRESHOLD)
+		pad_data->rt = ds3->R2_sens;
+
+	if (ds3->ps)
+		ksceCtrlSetButtonEmulation(0, 0, 0, SCE_CTRL_INTERCEPTED, 16);
+
+	if (buttons != 0 || left_js_moved || right_js_moved ||
+	    ds3->L2_sens > DS3_TRIGGER_THRESHOLD ||
+	    ds3->R2_sens > DS3_TRIGGER_THRESHOLD)
 		ksceKernelPowerTick(0);
+
+	pad_data->buttons |= buttons;
 }
 
-
-static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
-			    struct ds3_input_report *ds3)
+static void patch_ctrl_data_all_user(const struct ds3_input_report *ds3,
+				     int port, SceCtrlData *pad_data, int count)
 {
 	unsigned int i;
 
@@ -332,39 +367,43 @@ static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
 		SceCtrlData k_data;
 
 		ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)pad_data, sizeof(k_data));
-		if (abs(ds3->left_x - 128) > DS3_JOYSTICK_THRESHOLD)
-			k_data.lx = ds3->left_x;
-		if (abs(ds3->left_y - 128) > DS3_JOYSTICK_THRESHOLD)
-			k_data.ly = ds3->left_y;
-		if (abs(ds3->right_x - 128) > DS3_JOYSTICK_THRESHOLD)
-			k_data.rx = ds3->right_x;
-		if (abs(ds3->right_y - 128) > DS3_JOYSTICK_THRESHOLD)
-			k_data.ry = ds3->right_y;
+		patch_ctrl_data(ds3, &k_data);
 		ksceKernelMemcpyKernelToUser((uintptr_t)pad_data, &k_data, sizeof(k_data));
 
 		pad_data++;
 	}
 }
 
-static int SceCtrl_sceCtrlPeekBufferPositive2_hook_func(int port, SceCtrlData *pad_data, int count)
+static void patch_ctrl_data_all_kernel(const struct ds3_input_report *ds3,
+				       int port, SceCtrlData *pad_data, int count)
 {
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositive2_ref, port, pad_data, count);
+	unsigned int i;
 
-	if (ret >= 0 && ds3_connected)
-		patch_analogdata(port, pad_data, count, &ds3_input);
-
-	return ret;
+	for (i = 0; i < count; i++, pad_data++)
+		patch_ctrl_data(ds3, pad_data);
 }
 
-static int SceCtrl_sceCtrlReadBufferPositive2_hook_func(int port, SceCtrlData *pad_data, int count)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositive2_ref, port, pad_data, count);
+#define DECL_FUNC_HOOK_PATCH_CTRL(type, name) \
+	DECL_FUNC_HOOK(SceCtrl_##name, int port, SceCtrlData *pad_data, int count) \
+	{ \
+		int ret = TAI_CONTINUE(int, SceCtrl_ ##name##_ref, port, pad_data, count); \
+		if (ret >= 0 && ds3_connected) \
+			patch_ctrl_data_all_##type(&ds3_input, port, pad_data, count); \
+		return ret; \
+	}
 
-	if (ret >= 0 && ds3_connected)
-		patch_analogdata(port, pad_data, count, &ds3_input);
-
-	return ret;
-}
+DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlPeekBufferNegative)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferNegative2)
+DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlPeekBufferPositive)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferPositive2)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferPositiveExt)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferPositiveExt2)
+DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlReadBufferNegative)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferNegative2)
+DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlReadBufferPositive)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferPositive2)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferPositiveExt)
+DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferPositiveExt2)
 
 static void enqueue_read_request(unsigned int mac0, unsigned int mac1,
 				 SceBtHidRequest *request, unsigned char *buffer,
@@ -490,7 +529,7 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 
 		case 0x06: /* Device disconnect event*/
 			ds3_connected = 0;
-			reset_input_emulation();
+			ds3_input_reset();
 			break;
 
 		case 0x08: /* Connection requested event */
@@ -508,9 +547,10 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 
 			switch (recv_buff[0]) {
 			case 0x01: /* Full report */
+				/*
+				 * Save DS3 state to a global variable.
+				 */
 				memcpy(&ds3_input, recv_buff, sizeof(ds3_input));
-
-				set_input_emulation(&ds3_input);
 
 				enqueue_read_request(hid_event.mac0, hid_event.mac1,
 					&hid_request, recv_buff, sizeof(recv_buff));
@@ -573,10 +613,8 @@ static int ds3vita_bt_thread(SceSize args, void *argp)
 			break;
 	}
 
-	if (ds3_connected) {
+	if (ds3_connected)
 		ksceBtStartDisconnect(ds3_mac0, ds3_mac1);
-		reset_input_emulation();
-	}
 
 	ksceBtUnregisterCallback(bt_cb_uid);
 
@@ -620,14 +658,59 @@ int module_start(SceSize argc, const void *args)
 		&SceBt_sub_22947E4_ref, SceBt_modinfo.modid, 0,
 		0x22947E4 - 0x2280000, 1, SceBt_sub_22947E4_hook_func);
 
-	/* SceCtrl hooks (needed for PS4 remote play) */
-	SceCtrl_sceCtrlPeekBufferPositive2_hook_uid = taiHookFunctionExportForKernel(KERNEL_PID,
-		&SceCtrl_sceCtrlPeekBufferPositive2_ref, "SceCtrl", TAI_ANY_LIBRARY,
-		0x15F81E8C, SceCtrl_sceCtrlPeekBufferPositive2_hook_func);
+	/* Patch PAD Type */
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0xF11D0D30);
 
-	SceCtrl_sceCtrlReadBufferPositive2_hook_uid = taiHookFunctionExportForKernel(KERNEL_PID,
-		&SceCtrl_sceCtrlReadBufferPositive2_ref, "SceCtrl", TAI_ANY_LIBRARY,
-		0xC4226A3E, SceCtrl_sceCtrlReadBufferPositive2_hook_func);
+	/* SceCtrl hooks:
+	 * sceCtrlPeekBufferNegative -> ksceCtrlPeekBufferNegative
+	 * sceCtrlPeekBufferNegative2 -> none
+	 * sceCtrlPeekBufferPositive -> ksceCtrlPeekBufferPositive
+	 * sceCtrlPeekBufferPositive2 -> none
+	 * sceCtrlPeekBufferPositiveExt -> none
+	 * sceCtrlPeekBufferPositiveExt2 -> none
+	 * sceCtrlReadBufferNegative -> ksceCtrlReadBufferNegative
+	 * sceCtrlReadBufferNegative2 -> none
+	 * sceCtrlReadBufferPositive -> ksceCtrlReadBufferPositive
+	 * sceCtrlReadBufferPositive2 -> none
+	 * sceCtrlReadBufferPositiveExt -> none
+	 * sceCtrlReadBufferPositiveExt2 -> none
+	 */
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlPeekBufferNegative, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x19895843);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferNegative2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x81A89660);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlPeekBufferPositive, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0xEA1D3A34);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x15F81E8C);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0xA59454D3);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x860BF292);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlReadBufferNegative, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x8D4E0DD1);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferNegative2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x27A0C5FB);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlReadBufferPositive, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x9B96A1AA);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositive2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0xC4226A3E);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0xE2D99296);
+
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0xA7178860);
 
 	SceKernelHeapCreateOpt opt;
 	opt.size = 0x1C;
@@ -690,15 +773,20 @@ int module_stop(SceSize argc, const void *args)
 			SceBt_sub_22947E4_ref);
 	}
 
-	if (SceCtrl_sceCtrlPeekBufferPositive2_hook_uid > 0) {
-		taiHookReleaseForKernel(SceCtrl_sceCtrlPeekBufferPositive2_hook_uid,
-			SceCtrl_sceCtrlPeekBufferPositive2_ref);
-	}
+	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo);
 
-	if (SceCtrl_sceCtrlReadBufferPositive2_hook_uid > 0) {
-		taiHookReleaseForKernel(SceCtrl_sceCtrlReadBufferPositive2_hook_uid,
-			SceCtrl_sceCtrlReadBufferPositive2_ref);
-	}
+	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlPeekBufferNegative);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferNegative2);
+	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlPeekBufferPositive);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2);
+	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlReadBufferNegative);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferNegative2);
+	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlReadBufferPositive);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2);
 
 	/*if (SceBt_sub_2292CE4_0x2292D18_patch_uid > 0) {
 		taiInjectReleaseForKernel(SceBt_sub_2292CE4_0x2292D18_patch_uid);
