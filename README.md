@@ -11,8 +11,8 @@
 2. You need to refresh the config.txt by rebooting or through VitaShell.
 
 **Pairing the controller:**
-1. Download [this](http://dancingpixelstudios.com/sixaxis-controller/sixaxispairtool/) tool (or [this](https://help.ubuntu.com/community/Sixaxis?action=AttachFile&do=get&target=sixpair.c) other one if you want to compile it yourself)
-2. Connect your DS3 to the PC and open the tool
+1. Download [this](https://web.archive.org/web/20190120201936/http://dancingpixelstudios.com/sixaxis-controller/sixaxispairtool/)) tool (or [this](https://help.ubuntu.com/community/Sixaxis?action=AttachFile&do=get&target=sixpair.c) other one if you want to compile it yourself)
+2. Connect your DS3 or Sixaxis to the PC and open the tool
 3. Introduce the Vita's **MAC address plus 1** to the tool (Settings -> System -> System information)
 
 **Using it once paired (see above):**
